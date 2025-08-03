@@ -1571,15 +1571,312 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 ASTFunction::defarg_t defArgs, kwDefArgs;
                 const int defCount = operand & 0xFF;
                 const int kwDefCount = (operand >> 8) & 0xFF;
-                for (int i = 0; i < defCount; ++i) {
-                    defArgs.push_front(stack.top());
-                    stack.pop();
-                }
-                for (int i = 0; i < kwDefCount; ++i) {
-                    kwDefArgs.push_front(stack.top());
-                    stack.pop();
+                const int annotationCount = (operand >> 16) & 0x7FFF;
+                
+                /* Docs for 3.3 say KW Pairs come first, but reality disagrees */
+                if (mod->verCompare(3, 3) <= 0) {
+                    for (int i = 0; i < defCount; ++i) {
+                        defArgs.push_front(stack.top());
+                        stack.pop();
+                    }
+                    /* KW Defaults not mentioned in docs, but they come after the positional args */
+                    for (int i = 0; i < kwDefCount; ++i) {
+                        kwDefArgs.push_front(stack.top());
+                        stack.pop(); // KW Pair object
+                        stack.pop(); // KW Pair name
+                    }
+                } else if (mod->verCompare(3, 5) <= 0) {
+                    /* From Py 3.4 there can now be annotation params
+                    The order has also switched so Kwargs come before Pos Args */
+                    if(annotationCount) {
+                        stack.pop(); // Tuple of param names for annotations
+                        for (int i = 0; i < annotationCount; ++i) {
+                            stack.pop(); // Pop annotation objects and ignore
+                        }
+                    }
+                    for (int i = 0; i < kwDefCount; ++i) {
+                        kwDefArgs.push_front(stack.top());
+                        stack.pop(); // KW Pair object
+                        stack.pop(); // KW Pair name
+                    }
+                    for (int i = 0; i < defCount; ++i) {
+                        defArgs.push_front(stack.top());
+                        stack.pop();
+                    }
+                } else {
+                    /* From Py 3.6  the operand stopped being an argument count
+                    and changed to a flag that indicates what is represented by
+                    preceding tuples on the stack. Docs for 3.7 are clearer,
+                    docs for 3.6 may have not been correctly updated */
+                    if(operand & 0x08) { // Cells for free vars to create a closure
+                        stack.pop(); // Ignore these for syntax generation
+                    }
+                    if(operand & 0x04) { // Annotation dict (3.6-9) or string (3.10+)
+                        stack.pop(); // Ignore annotations
+                    }
+                    if(operand & 0x02) { // Kwarg Defaults
+                        PycRef<ASTNode> kw_tuple = stack.top();
+                        stack.pop();
+                        std::vector<PycRef<ASTNode>> kw_values = kw_tuple.cast<ASTConstMap>()->values();
+                        
+                        for(const PycRef<ASTNode>& kw : kw_values) {
+                            kwDefArgs.push_front(kw);
+                        }
+                    }
+                    if(operand & 0x01) { // Positional Defaults (including positional-or-KW args)
+                        PycRef<ASTNode> pos_tuple = stack.top();
+                        stack.pop();
+                        std::vector<PycRef<PycObject>> pos_values = pos_tuple.cast<ASTObject>()->object().cast<PycTuple>()->values();
+                        
+                        for(const PycRef<PycObject>& pos : pos_values) {
+                            defArgs.push_back(new ASTObject(pos));
+                        }
+                    }
                 }
                 stack.push(new ASTFunction(fun_code, defArgs, kwDefArgs));
+            }
+            break;
+        case Pyc::MAKE_FUNCTION:
+            {
+                /* Python 3.13+ simplified MAKE_FUNCTION - no function attributes on stack */
+                PycRef<ASTNode> fun_code = stack.top();
+                stack.pop();
+
+                ASTFunction::defarg_t defArgs, kwDefArgs;
+                stack.push(new ASTFunction(fun_code, defArgs, kwDefArgs));
+            }
+            break;
+        case Pyc::SET_FUNCTION_ATTRIBUTE_A:
+            {
+                /* Python 3.13+ SET_FUNCTION_ATTRIBUTE sets attributes on function objects */
+                PycRef<ASTNode> attribute_value = stack.top();
+                stack.pop();
+                PycRef<ASTNode> function = stack.top();
+                stack.pop();
+                
+                /* Apply the attribute to the function based on the flag */
+                if (function.type() == ASTNode::NODE_FUNCTION) {
+                    PycRef<ASTFunction> func = function.cast<ASTFunction>();
+                    ASTFunction::defarg_t defArgs = func->defargs();
+                    ASTFunction::defarg_t kwDefArgs = func->kwdefargs();
+                    
+                    switch (operand) {
+                        case 0x01: // Default values for positional-only and positional-or-keyword parameters
+                            if (attribute_value.type() == ASTNode::NODE_OBJECT) {
+                                PycRef<PycObject> tuple_obj = attribute_value.cast<ASTObject>()->object();
+                                if (tuple_obj.type() == PycObject::TYPE_TUPLE) {
+                                    std::vector<PycRef<PycObject>> pos_values = tuple_obj.cast<PycTuple>()->values();
+                                    defArgs.clear();
+                                    for(const PycRef<PycObject>& pos : pos_values) {
+                                        defArgs.push_back(new ASTObject(pos));
+                                    }
+                                }
+                            }
+                            break;
+                        case 0x02: // Dictionary of keyword-only parameters' default values
+                            if (attribute_value.type() == ASTNode::NODE_CONST_MAP) {
+                                std::vector<PycRef<ASTNode>> kw_values = attribute_value.cast<ASTConstMap>()->values();
+                                kwDefArgs.clear();
+                                for(const PycRef<ASTNode>& kw : kw_values) {
+                                    kwDefArgs.push_back(kw);
+                                }
+                            }
+                            break;
+                        case 0x04: // Tuple of strings containing parameters' annotations
+                            // Ignore annotations for now
+                            break;
+                        case 0x08: // Tuple containing cells for free variables (closure)
+                            // Ignore closure cells for now
+                            break;
+                        default:
+                            // Unknown attribute flag, ignore
+                            break;
+                    }
+                    
+                    stack.push(new ASTFunction(func->code(), defArgs, kwDefArgs));
+                } else {
+                    // Not a function, just push it back
+                    stack.push(function);
+                }
+            }
+            break;
+        case Pyc::TO_BOOL:
+            {
+                /* Python 3.13+ TO_BOOL: Implements STACK[-1] = bool(STACK[-1]) */
+                PycRef<ASTNode> value = stack.top();
+                stack.pop();
+                
+                /* Create a call to bool() function */
+                ASTCall::pparam_t params;
+                params.push_back(value);
+                ASTCall::kwparam_t kwparams;
+                
+                PycRef<PycString> bool_str = new PycString();
+                bool_str->setValue("bool");
+                PycRef<ASTNode> bool_name = new ASTName(bool_str);
+                stack.push(new ASTCall(bool_name, params, kwparams));
+            }
+            break;
+        case Pyc::CALL_KW_A:
+            {
+                /* Python 3.13+ CALL_KW: Calls with keyword arguments */
+                PycRef<ASTNode> kwnames = stack.top();
+                stack.pop();
+                
+                int kwcount = 0;
+                if (kwnames.type() == ASTNode::NODE_OBJECT) {
+                    PycRef<PycObject> tuple_obj = kwnames.cast<ASTObject>()->object();
+                    if (tuple_obj.type() == PycObject::TYPE_TUPLE) {
+                        kwcount = tuple_obj.cast<PycTuple>()->values().size();
+                    }
+                }
+                
+                int poscount = operand - kwcount;
+                
+                ASTCall::pparam_t pparams;
+                ASTCall::kwparam_t kwparams;
+                
+                /* Pop keyword arguments */
+                for (int i = 0; i < kwcount; ++i) {
+                    PycRef<ASTNode> value = stack.top();
+                    stack.pop();
+                    
+                    /* Create a dummy key name for now */
+                    PycRef<PycString> key_str = new PycString();
+                    key_str->setValue("kwarg");
+                    PycRef<ASTNode> key = new ASTName(key_str);
+                    
+                    kwparams.push_front(std::make_pair(key, value));
+                }
+                
+                /* Pop positional arguments */
+                for (int i = 0; i < poscount; ++i) {
+                    pparams.push_front(stack.top());
+                    stack.pop();
+                }
+                
+                /* Pop self or NULL */
+                if (!stack.empty()) {
+                    PycRef<ASTNode> self_or_null = stack.top();
+                    if (self_or_null.type() != ASTNode::NODE_OBJECT || 
+                        self_or_null.cast<ASTObject>()->object().type() != PycObject::TYPE_NULL) {
+                        pparams.push_front(self_or_null);
+                    }
+                    stack.pop();
+                }
+                
+                /* Pop callable */
+                PycRef<ASTNode> func = stack.top();
+                stack.pop();
+                
+                stack.push(new ASTCall(func, pparams, kwparams));
+            }
+            break;
+        case Pyc::BEFORE_WITH:
+            {
+                /* Python 3.11+ BEFORE_WITH: Prepares for with statement */
+                PycRef<ASTNode> context_manager = stack.top();
+                stack.pop();
+                
+                /* This is a simplified implementation - just push the context manager back */
+                /* In a full implementation, this would handle __enter__ and __exit__ setup */
+                stack.push(context_manager);
+            }
+            break;
+        case Pyc::MAKE_CELL_A:
+            {
+                /* Python 3.11+ MAKE_CELL: Creates a new cell in slot i */
+                /* For decompilation purposes, we can largely ignore this */
+                /* as it's primarily for closure variable management */
+                break;
+            }
+            break;
+        case Pyc::PUSH_EXC_INFO:
+            {
+                /* Python 3.11+ PUSH_EXC_INFO: Pushes exception info for handlers */
+                PycRef<ASTNode> value = stack.top();
+                stack.pop();
+                
+                /* Push current exception (we'll use a placeholder) */
+                PycRef<PycString> exc_str = new PycString();
+                exc_str->setValue("__exception__");
+                PycRef<ASTNode> exc_name = new ASTName(exc_str);
+                stack.push(exc_name);
+                
+                /* Push the original value back */
+                stack.push(value);
+            }
+            break;
+        case Pyc::CHECK_EXC_MATCH:
+            {
+                /* Python 3.11+ CHECK_EXC_MATCH: Tests exception matching for except */
+                PycRef<ASTNode> exception_type = stack.top();
+                stack.pop();
+                PycRef<ASTNode> exception_value = stack.top();
+                stack.pop();
+                
+                /* Create an isinstance() call to check exception matching */
+                ASTCall::pparam_t params;
+                params.push_back(exception_value);
+                params.push_back(exception_type);
+                ASTCall::kwparam_t kwparams;
+                
+                PycRef<PycString> isinstance_str = new PycString();
+                isinstance_str->setValue("isinstance");
+                PycRef<ASTNode> isinstance_name = new ASTName(isinstance_str);
+                
+                stack.push(new ASTCall(isinstance_name, params, kwparams));
+            }
+            break;
+        case Pyc::RERAISE_A:
+            {
+                /* Python 3.9+ RERAISE: Re-raises the exception currently on top of the stack */
+                if (operand > 0) {
+                    /* Pop additional value for f_lasti if operand is non-zero */
+                    stack.pop();
+                }
+                
+                /* Create a raise statement without arguments (re-raise) */
+                ASTRaise::param_t params;
+                stack.push(new ASTRaise(params));
+            }
+            break;
+        case Pyc::LOAD_FAST_CHECK_A:
+            {
+                /* Python 3.12+ LOAD_FAST_CHECK: Load local variable with UnboundLocalError check */
+                PycRef<PycString> varname = code->getLocal(operand);
+                if (varname != nullptr) {
+                    stack.push(new ASTName(varname));
+                } else {
+                    /* Create a placeholder if operand is out of range */
+                    PycRef<PycString> placeholder_str = new PycString();
+                    placeholder_str->setValue("__unbound_local__");
+                    stack.push(new ASTName(placeholder_str));
+                }
+            }
+            break;
+        case Pyc::FORMAT_SIMPLE:
+            {
+                /* Python 3.13+ FORMAT_SIMPLE: Formats value for f-strings */
+                PycRef<ASTNode> value = stack.top();
+                stack.pop();
+                
+                /* Create a call to value.__format__("") */
+                ASTCall::pparam_t params;
+                
+                /* Create empty string for format spec */
+                PycRef<PycString> empty_str = new PycString();
+                empty_str->setValue("");
+                params.push_back(new ASTObject(empty_str.cast<PycObject>()));
+                
+                ASTCall::kwparam_t kwparams;
+                
+                /* Create __format__ method call */
+                PycRef<PycString> format_str = new PycString();
+                format_str->setValue("__format__");
+                PycRef<ASTNode> format_attr = new ASTBinary(value, new ASTName(format_str), ASTBinary::BIN_ATTR);
+                
+                stack.push(new ASTCall(format_attr, params, kwparams));
             }
             break;
         case Pyc::NOP:
@@ -2880,8 +3177,26 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 // This avoids problems when ''' or """ is part of the string.
                 print_const(pyc_output, val.cast<ASTObject>()->object(), mod, F_STRING_QUOTE);
                 break;
+            case ASTNode::NODE_CALL:
+                // Handle function calls within f-strings
+                print_src(val, mod, pyc_output);
+                break;
+            case ASTNode::NODE_NAME:
+                // Handle variable names within f-strings
+                print_src(val, mod, pyc_output);
+                break;
+            case ASTNode::NODE_BINARY:
+                // Handle binary operations within f-strings
+                print_src(val, mod, pyc_output);
+                break;
+            case ASTNode::NODE_SUBSCR:
+                // Handle subscript operations within f-strings
+                print_src(val, mod, pyc_output);
+                break;
             default:
-                fprintf(stderr, "Unsupported node type %d in NODE_JOINEDSTR\n", val.type());
+                // For any other node type, try to print it normally
+                print_src(val, mod, pyc_output);
+                break;
             }
         }
         pyc_output << F_STRING_QUOTE;
